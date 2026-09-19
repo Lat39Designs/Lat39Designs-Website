@@ -1,0 +1,141 @@
+name: Pull Request Preview
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: lat39-pr-preview-publisher
+  cancel-in-progress: false
+
+jobs:
+  preview:
+    # Previews may write to main, so only branches inside this repository are allowed.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out pull request
+        if: github.event.action != 'closed'
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: pr
+          persist-credentials: false
+
+      - name: Check out main
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          path: site
+          fetch-depth: 0
+
+      - name: Configure Git
+        working-directory: site
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Publish preview
+        if: github.event.action != 'closed'
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          DEST="site/previews/pr-${PR_NUMBER}"
+          rm -rf "$DEST"
+          mkdir -p "$DEST"
+
+          rsync -a \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='previews' \
+            --exclude='CNAME' \
+            --exclude='README.txt' \
+            pr/ "$DEST/"
+
+          cd site
+          git add "previews/pr-${PR_NUMBER}"
+          if ! git diff --cached --quiet; then
+            git commit -m "Update preview for PR #${PR_NUMBER}"
+            git push origin main
+          fi
+
+      - name: Wait for GitHub Pages preview
+        if: github.event.action != 'closed'
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          PREVIEW_URL="https://www.lat39designs.com/previews/pr-${PR_NUMBER}/"
+          echo "Waiting for $PREVIEW_URL to become available..."
+
+          for attempt in $(seq 1 36); do
+            STATUS=$(curl -L -s -o /dev/null -w "%{http_code}" "$PREVIEW_URL" || true)
+            if [ "$STATUS" = "200" ]; then
+              echo "Preview is live."
+              exit 0
+            fi
+            echo "Attempt $attempt: HTTP $STATUS; retrying in 5 seconds..."
+            sleep 5
+          done
+
+          echo "Preview did not become available within 3 minutes."
+          exit 1
+
+      - name: Remove closed preview
+        if: github.event.action == 'closed'
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          cd site
+          rm -rf "previews/pr-${PR_NUMBER}"
+          git add -A "previews/pr-${PR_NUMBER}"
+          if ! git diff --cached --quiet; then
+            git commit -m "Remove preview for PR #${PR_NUMBER}"
+            git push origin main
+          fi
+
+      - name: Post or update preview link
+        if: github.event.action != 'closed'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          MARKER='<!-- lat39-pr-preview -->'
+          PREVIEW_URL="https://www.lat39designs.com/previews/pr-${PR_NUMBER}/"
+          BODY=$(printf '%s\n🔍 **Website preview:** %s\n\nThis preview updates automatically when this pull request changes.' "$MARKER" "$PREVIEW_URL")
+
+          COMMENT_ID=$(gh api "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments" --paginate \
+            --jq ".[] | select(.body | contains(\"${MARKER}\")) | .id" | head -n 1 || true)
+
+          if [ -n "$COMMENT_ID" ]; then
+            gh api --method PATCH "repos/${REPOSITORY}/issues/comments/${COMMENT_ID}" -f body="$BODY" >/dev/null
+          else
+            gh api --method POST "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments" -f body="$BODY" >/dev/null
+          fi
+
+      - name: Mark preview removed
+        if: github.event.action == 'closed'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          MARKER='<!-- lat39-pr-preview -->'
+          BODY=$(printf '%s\n✅ Website preview removed because this pull request is closed.' "$MARKER")
+
+          COMMENT_ID=$(gh api "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments" --paginate \
+            --jq ".[] | select(.body | contains(\"${MARKER}\")) | .id" | head -n 1 || true)
+
+          if [ -n "$COMMENT_ID" ]; then
+            gh api --method PATCH "repos/${REPOSITORY}/issues/comments/${COMMENT_ID}" -f body="$BODY" >/dev/null
+          fi
