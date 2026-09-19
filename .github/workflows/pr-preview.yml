@@ -65,6 +65,28 @@ jobs:
             git push origin main
           fi
 
+      - name: Wait for GitHub Pages preview
+        if: github.event.action != 'closed'
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          PREVIEW_URL="https://www.lat39designs.com/previews/pr-${PR_NUMBER}/"
+          echo "Waiting for $PREVIEW_URL to become available..."
+
+          for attempt in $(seq 1 36); do
+            STATUS=$(curl -L -s -o /dev/null -w "%{http_code}" "$PREVIEW_URL" || true)
+            if [ "$STATUS" = "200" ]; then
+              echo "Preview is live."
+              exit 0
+            fi
+            echo "Attempt $attempt: HTTP $STATUS; retrying in 5 seconds..."
+            sleep 5
+          done
+
+          echo "Preview did not become available within 3 minutes."
+          exit 1
+
       - name: Remove closed preview
         if: github.event.action == 'closed'
         env:
